@@ -1,4 +1,4 @@
-"""
+﻿"""
 schwab_client.py
 ----------------
 Handles OAuth2 authentication and all Schwab Market Data API calls.
@@ -29,7 +29,7 @@ class SchwabClient:
     Handles token refresh automatically.
     """
 
-    TOKEN_FILE = "/app/schwab_tokens.json"  # persists across requests
+    TOKEN_FILE = "/app/schwab_tokens.json" if os.path.exists("/app") else os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "schwab_tokens.json")  # persists across requests
 
     def __init__(self):
         self.access_token: Optional[str] = None

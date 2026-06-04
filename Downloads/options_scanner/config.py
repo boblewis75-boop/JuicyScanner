@@ -1,4 +1,4 @@
-# ============================================================
+﻿# ============================================================
 #  JuicyScanner — Configuration
 #
 #  LOCAL:  Set values directly below
@@ -7,6 +7,8 @@
 # ============================================================
 
 import os
+from dotenv import load_dotenv
+load_dotenv()
 
 # --- Schwab API Credentials ---
 SCHWAB_APP_KEY      = os.environ.get("SCHWAB_APP_KEY",     "YOUR_APP_KEY_HERE")
