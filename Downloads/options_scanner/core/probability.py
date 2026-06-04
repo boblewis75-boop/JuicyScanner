@@ -75,13 +75,14 @@ def calculate_likelihood(
     tech_conf = tech_score if tech_score is not None else 50.0
 
     # ── Weighted blend ───────────────────────────────────────────
-    # Delta is most reliable for ITM prob, BS for target touch,
-    # historical adds base-rate anchor, tech adds directional edge
+    # Delta most reliable, hist gives base rate anchor,
+    # BS touch overstates (barriers rarely touched cleanly), down-weighted
+    # Tech adds directional edge
     weights = {
-        "delta":    0.25,
-        "bs":       0.30,
-        "hist":     0.25,
-        "tech":     0.20,
+        "delta":    0.35,   # most reliable signal
+        "bs":       0.15,   # touch prob overstates reality — down-weighted
+        "hist":     0.30,   # base rate from IV/DTE
+        "tech":     0.20,   # directional bias
     }
 
     likelihood = (
@@ -154,7 +155,8 @@ def _bs_touch_probability(
     if direction == "PUT":
         prob = 1 - prob
 
-    return round(min(95, max(5, prob * 100)), 1)
+    # Cap at 85 — touch prob is theoretical, real markets overshoot/undershoot
+    return round(min(85, max(5, prob * 100)), 1)
 
 
 def _historical_move_probability(
@@ -213,9 +215,9 @@ def _build_breakdown(
         f"Historically, the underlying makes a {target_pct:.0f}%+ {direction} move in {dte} days roughly {hist_prob:.0f}% of the time based on current IV."
     )
     return (
-        f"Delta model: {delta_prob:.0f}% ITM probability. "
-        f"B-S barrier model: {bs_prob:.0f}% chance of touching target. "
+        f"Delta: {delta_prob:.0f}% ITM prob. "
+        f"Target touch: {bs_prob:.0f}%. "
         f"{hist_note} "
         f"{tech_note} "
-        f"Combined likelihood: {likelihood}%."
+        f"Combined: {likelihood}%."
     )

@@ -21,7 +21,8 @@ from typing import List, Dict, Any, Optional
 # Storage
 # ─────────────────────────────────────────────────────────────────
 
-WATCHLIST_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "watchlists.json")
+_LOCAL_WL = os.path.join(os.path.dirname(__file__), "..", "data", "watchlists.json")
+WATCHLIST_FILE = "/app/watchlists.json" if os.path.exists("/app") else _LOCAL_WL
 
 
 def _load() -> Dict:

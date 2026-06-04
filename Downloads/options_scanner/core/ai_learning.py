@@ -20,7 +20,9 @@ import math
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 
-LEARNING_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "ai_learning.json")
+# Use /app/ on Railway (persistent), fall back to local data/ for dev
+_LOCAL_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "ai_learning.json")
+LEARNING_FILE = "/app/ai_learning.json" if os.path.exists("/app") else _LOCAL_FILE
 
 # ─── Default factor weights (must sum to 1.0) ───────────────────
 DEFAULT_WEIGHTS = {

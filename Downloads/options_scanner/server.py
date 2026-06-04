@@ -1,24 +1,24 @@
-"""
+﻿"""
 server.py
 ---------
 FastAPI REST server for OptionsEdge AI.
 
 Endpoints:
-  GET  /scan                      — Scan full watchlist
-  GET  /scan/{symbol}             — Scan single ticker
-  GET  /technicals/{symbol}       — Full technical analysis for a symbol
-  GET  /quote/{symbol}            — Current quote
-  GET  /watchlist                 — Get all watchlists
-  POST /watchlist                 — Create new watchlist
-  DELETE /watchlist/{name}        — Delete a watchlist
-  GET  /watchlist/{name}/symbols  — Get symbols in a list
-  POST /watchlist/{name}/symbols  — Add symbol to list
-  DELETE /watchlist/{name}/symbols/{symbol} — Remove symbol
-  PUT  /watchlist/{name}/symbols/{symbol}   — Update symbol (note/tags/alerts)
-  GET  /watchlist/{name}/scan     — Scan a specific watchlist
-  GET  /auth/url                  — Schwab OAuth URL
-  POST /auth/token                — Exchange auth code
-  GET  /health                    — Health check
+  GET  /scan                      â€” Scan full watchlist
+  GET  /scan/{symbol}             â€” Scan single ticker
+  GET  /technicals/{symbol}       â€” Full technical analysis for a symbol
+  GET  /quote/{symbol}            â€” Current quote
+  GET  /watchlist                 â€” Get all watchlists
+  POST /watchlist                 â€” Create new watchlist
+  DELETE /watchlist/{name}        â€” Delete a watchlist
+  GET  /watchlist/{name}/symbols  â€” Get symbols in a list
+  POST /watchlist/{name}/symbols  â€” Add symbol to list
+  DELETE /watchlist/{name}/symbols/{symbol} â€” Remove symbol
+  PUT  /watchlist/{name}/symbols/{symbol}   â€” Update symbol (note/tags/alerts)
+  GET  /watchlist/{name}/scan     â€” Scan a specific watchlist
+  GET  /auth/url                  â€” Schwab OAuth URL
+  POST /auth/token                â€” Exchange auth code
+  GET  /health                    â€” Health check
 """
 
 import sys
@@ -39,6 +39,14 @@ from config import (
 from core.scanner import scan_options
 from core.technicals import analyze as analyze_technicals, generate_mock_bars
 from core import watchlist as wl
+from core.brain import (
+    get_state as brain_state,
+    start_tracking as brain_track,
+    close_play as brain_close,
+    update_entry as brain_update_entry,
+    reset_weights as brain_reset,
+    auto_log_scan as brain_auto_log,
+)
 from data.mock_data import get_mock_options_chain, get_mock_quote
 
 
@@ -79,11 +87,28 @@ def fetch_quote(symbol: str) -> dict:
 
 
 def fetch_bars(symbol: str) -> list:
-    """Fetch OHLCV bars — mock for now, swap for Schwab price history when live."""
+    """Fetch OHLCV daily bars â€” real Schwab data in live mode, converted to Bar objects."""
+    from core.technicals import Bar
     if USE_LIVE_DATA:
-        # TODO: call Schwab price history endpoint
-        # return get_schwab_client().get_price_history(symbol, period_type="month", period=6)
-        return generate_mock_bars(symbol)
+        try:
+            raw = get_schwab_client().get_price_history(symbol, period_type="month", period=6)
+            if not raw or len(raw) < 10:
+                raise ValueError(f"Too few bars: {len(raw) if raw else 0}")
+            # Convert Schwab dicts â†’ Bar objects
+            bars = []
+            for r in raw:
+                bars.append(Bar(
+                    date=str(r.get("datetime", "")),
+                    open=float(r.get("open", 0)),
+                    high=float(r.get("high", 0)),
+                    low=float(r.get("low", 0)),
+                    close=float(r.get("close", 0)),
+                    volume=int(r.get("volume", 0)),
+                ))
+            return bars
+        except Exception as e:
+            print(f"âš ï¸  Price history failed for {symbol}: {e}, falling back to mock")
+            return generate_mock_bars(symbol)
     return generate_mock_bars(symbol)
 
 
@@ -111,29 +136,89 @@ def scan_all(
     min_target:    float = Query(DEFAULT_MIN_TARGET),
     max_dte:       int   = Query(DEFAULT_MAX_DTE),
     min_score:     int   = Query(DEFAULT_MIN_SCORE),
-    min_oi:        int   = Query(DEFAULT_MIN_OI),
+    min_oi:        int   = Query(50),
     contract_type: str   = Query("ALL"),
+    max_premium:   float = Query(999,  description="Max option premium price"),
+    exclude:       str   = Query(None, description="Comma-separated symbols to exclude"),
+    dedup:         bool  = Query(True,  description="Show only top play per ticker"),
     symbols:       Optional[str] = Query(None, description="Comma-separated symbols"),
 ):
     tickers     = symbols.upper().split(",") if symbols else WATCHLIST
     all_results = []
     errors      = []
 
-    for symbol in tickers:
+    # Fetch flow once for all symbols (shared context)
+    try:
+        from core.flow import scan_flow, generate_mock_flow
+        if USE_LIVE_DATA:
+            flow_prints = scan_flow(get_schwab_client(), tickers[:10])
+        else:
+            flow_prints = generate_mock_flow(tickers[:10])
+        shared_flow = {"prints": flow_prints}
+    except Exception:
+        shared_flow = None
+
+    def _scan_one(symbol):
         try:
             chain = fetch_chain(symbol, max_dte)
             quote = fetch_quote(symbol)
-            bars  = fetch_bars(symbol)
+            bars  = generate_mock_bars(symbol)
+            # Fetch GEX for this symbol
+            gex_d = None
+            try:
+                from core.scanner import score_gex_confluence
+                if USE_LIVE_DATA:
+                    gex_chain = get_schwab_client().get_options_chain(
+                        symbol, days_to_exp=max_dte*5, contract_type="ALL")
+                    spot = gex_chain.get("underlyingPrice") or quote.get("lastPrice", 0)
+                    # Build minimal gex summary from chain
+                    gex_d = _build_gex_summary(gex_chain, spot)
+            except Exception:
+                gex_d = None
             plays = scan_options(
                 chain, quote, bars=bars,
                 min_rr=min_rr, min_target=min_target, max_dte=max_dte,
                 min_score=min_score, min_oi=min_oi, contract_type=contract_type,
+                gex_data=gex_d, flow_data=shared_flow, auto_save=True,
             )
-            all_results.extend(plays)
+            return plays, None
         except Exception as e:
-            errors.append({"symbol": symbol, "error": str(e)})
+            return [], {"symbol": symbol, "error": str(e)}
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(_scan_one, sym): sym for sym in tickers}
+        for future in as_completed(futures, timeout=45):
+            try:
+                plays, err = future.result()
+                if err:
+                    errors.append(err)
+                else:
+                    all_results.extend(plays)
+            except Exception as e:
+                errors.append({"symbol": "unknown", "error": str(e)})
 
     all_results.sort(key=lambda x: x["score"], reverse=True)
+
+    # Apply premium filter
+    if max_premium < 999:
+        all_results = [p for p in all_results if p.get("premium", 999) <= max_premium]
+
+    # Apply exclude filter (indexes etc)
+    if exclude:
+        excl_set = {s.strip().upper() for s in exclude.split(",")}
+        all_results = [p for p in all_results if p.get("ticker", "").upper() not in excl_set]
+
+    # Deduplication â€” keep only top-scoring play per ticker
+    if dedup:
+        seen = {}
+        deduped = []
+        for p in all_results:  # already sorted by score desc
+            ticker = p.get("ticker", "")
+            if ticker not in seen:
+                seen[ticker] = True
+                deduped.append(p)
+        all_results = deduped
 
     return {
         "mode":    "LIVE" if USE_LIVE_DATA else "MOCK",
@@ -144,6 +229,7 @@ def scan_all(
         "filters": {
             "min_rr": min_rr, "min_target": min_target, "max_dte": max_dte,
             "min_score": min_score, "contract_type": contract_type,
+            "max_premium": max_premium,
         }
     }
 
@@ -162,10 +248,24 @@ def scan_single(
         chain = fetch_chain(symbol, max_dte)
         quote = fetch_quote(symbol)
         bars  = fetch_bars(symbol)
+        # Fetch GEX + flow for single-symbol scan
+        gex_d = None; flow_d = None
+        try:
+            if USE_LIVE_DATA:
+                gex_chain = get_schwab_client().get_options_chain(
+                    symbol, days_to_exp=max_dte*5, contract_type="ALL")
+                spot  = gex_chain.get("underlyingPrice") or quote.get("lastPrice", 0)
+                gex_d = _build_gex_summary(gex_chain, spot)
+            from core.flow import scan_flow, generate_mock_flow
+            flow_prints = scan_flow(get_schwab_client(), [symbol]) if USE_LIVE_DATA else generate_mock_flow([symbol])
+            flow_d = {"prints": flow_prints}
+        except Exception:
+            pass
         plays = scan_options(
             chain, quote, bars=bars,
             min_rr=min_rr, min_target=min_target, max_dte=max_dte,
             min_score=min_score, contract_type=contract_type,
+            gex_data=gex_d, flow_data=flow_d, auto_save=True,
         )
         return {
             "symbol":          symbol,
@@ -184,13 +284,39 @@ def scan_single(
 
 @app.get("/technicals/{symbol}")
 def get_technicals(symbol: str):
-    """Full technical analysis for a symbol — RSI, MACD, MAs, volume, channel."""
+    """Full technical analysis for a symbol â€” RSI, MACD, MAs, volume, channel."""
     symbol = symbol.upper()
     try:
-        bars = fetch_bars(symbol)
+        # Try real bars first, fall back to mock on any error
+        try:
+            bars = fetch_bars(symbol)
+            if not bars or len(bars) < 10:
+                raise ValueError(f"Not enough bars: {len(bars) if bars else 0}")
+        except Exception as bar_err:
+            print(f"âš ï¸  Bars failed for {symbol}: {bar_err}, using mock")
+            bars = generate_mock_bars(symbol)
+
         tech = analyze_technicals(bars, symbol=symbol)
+
+        # Try to get live price, fail silently
+        try:
+            quote = fetch_quote(symbol)
+            live_price = (
+                quote.get("lastPrice") or
+                quote.get("mark") or
+                quote.get("last") or
+                quote.get("closePrice") or 0
+            )
+            if live_price:
+                tech["current_price"] = live_price
+                tech["live_price"]    = live_price
+        except Exception as q_err:
+            print(f"âš ï¸  Quote failed for {symbol}: {q_err}")
+
         return tech
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -351,11 +477,47 @@ def scan_watchlist(
 
 @app.get("/auth/url")
 def get_auth_url():
+    """Returns the Schwab auth URL â€” open it in your browser to authorize."""
     client = get_schwab_client()
-    return {
-        "auth_url": client.get_auth_url(),
-        "instructions": "Open this URL in your browser, authorize, then copy the 'code' from the redirect URL and call POST /auth/token"
-    }
+    url = client.get_auth_url()
+    # Redirect directly to Schwab login
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url=url)
+
+
+@app.get("/auth/callback")
+def auth_callback(code: str = None, session: str = None, error: str = None):
+    """
+    Schwab redirects here after authorization.
+    Auto-exchanges the code for tokens â€” no manual step needed.
+    Just open /auth/url and approve, tokens are saved automatically.
+    """
+    from fastapi.responses import HTMLResponse
+    if error:
+        return HTMLResponse(f"""
+        <html><body style="font-family:monospace;background:#0d0910;color:#f87171;padding:40px">
+        <h2>âŒ Auth Error</h2><p>{error}</p>
+        </body></html>""")
+    if not code:
+        return HTMLResponse("""
+        <html><body style="font-family:monospace;background:#0d0910;color:#f87171;padding:40px">
+        <h2>âŒ No code received</h2>
+        </body></html>""")
+    try:
+        get_schwab_client().exchange_code_for_tokens(code)
+        return HTMLResponse("""
+        <html><body style="font-family:monospace;background:#0d0910;color:#a855f7;padding:40px;text-align:center">
+        <h1 style="font-size:3rem">âœ…</h1>
+        <h2 style="color:#22c55e">Authenticated Successfully!</h2>
+        <p style="color:#9ca3af">Tokens saved. JuicyScanner is now in LIVE MODE.</p>
+        <p style="color:#9ca3af;margin-top:20px">You can close this tab.</p>
+        <script>setTimeout(()=>window.close(),3000)</script>
+        </body></html>""")
+    except Exception as e:
+        return HTMLResponse(f"""
+        <html><body style="font-family:monospace;background:#0d0910;color:#f87171;padding:40px">
+        <h2>âŒ Token Exchange Failed</h2><pre>{str(e)}</pre>
+        </body></html>""")
 
 
 class TokenRequest(BaseModel):
@@ -363,8 +525,15 @@ class TokenRequest(BaseModel):
 
 @app.post("/auth/token")
 def exchange_token(req: TokenRequest):
+    """Manual token exchange (fallback)."""
     try:
-        tokens = get_schwab_client().exchange_code_for_tokens(req.code)
+        # Handle both raw code and full URL
+        code = req.code
+        if "session" in code:
+            from urllib.parse import parse_qs, urlparse
+            qs = parse_qs(urlparse("?" + code.split("?")[-1]).query)
+            code = qs.get("code", [code])[0]
+        get_schwab_client().exchange_code_for_tokens(code)
         return {"status": "success", "message": "Authenticated with Schwab successfully."}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -375,7 +544,7 @@ def exchange_token(req: TokenRequest):
 # ----------------------------------------------------------------
 
 # ----------------------------------------------------------------
-# DEBUG endpoint — see raw Schwab data
+# DEBUG endpoint â€” see raw Schwab data
 # ----------------------------------------------------------------
 
 @app.get("/debug/{symbol}")
@@ -434,12 +603,142 @@ async def debug_chain(symbol: str):
         import traceback
         return {"error": str(e), "traceback": traceback.format_exc()}
 
+@app.get("/debug/scan/{symbol}")
+async def debug_scan(symbol: str):
+    """Shows exactly how many contracts pass each filter stage."""
+    try:
+        chain = fetch_chain(symbol.upper(), max_dte=45)
+        spot  = chain.get("underlyingPrice", 0)
+        
+        from core.scanner import _flatten_chain
+        import math
+        
+        all_contracts = _flatten_chain(chain, "ALL")
+        
+        stats = {
+            "total_flattened": len(all_contracts),
+            "spot": spot,
+            "mode": "LIVE" if USE_LIVE_DATA else "MOCK",
+        }
+        
+        # Stage by stage filter counts
+        after_dte       = [c for c in all_contracts if c.get("daysToExpiration", 0) <= 45]
+        after_oi        = [c for c in after_dte      if c.get("openInterest", 0) >= 50]
+        after_bid       = [c for c in after_oi       if (c.get("bid", 0) or 0) > 0]
+        after_nonstand  = [c for c in after_bid      if not c.get("nonStandard", False)]
+        
+        def spread_ok(c):
+            bid = c.get("bid", 0) or 0
+            ask = c.get("ask", 0) or 0
+            mid = (bid + ask) / 2
+            if mid <= 0: return False
+            return (ask - bid) / mid <= 0.35
+        
+        after_spread = [c for c in after_nonstand if spread_ok(c)]
+        
+        # Sample a passing contract
+        sample = after_spread[0] if after_spread else {}
+        sample_fields = {k: sample.get(k) for k in 
+            ["putCall","strikePrice","bid","ask","delta","gamma","theta",
+             "volatility","openInterest","totalVolume","daysToExpiration",
+             "nonStandard","inTheMoney"]} if sample else {}
+        
+        stats.update({
+            "after_dte_filter":        len(after_dte),
+            "after_oi_filter":         len(after_oi),
+            "after_bid_filter":        len(after_bid),
+            "after_nonstandard_filter":len(after_nonstand),
+            "after_spread_filter":     len(after_spread),
+            "sample_passing_contract": sample_fields,
+        })
+        
+        # Check target_pct on passing contracts
+        if after_spread:
+            targets = []
+            for c in after_spread[:20]:
+                bid = c.get("bid",0) or 0
+                ask = c.get("ask",0) or 0
+                mid = (bid+ask)/2
+                delta = abs(c.get("delta",0) or 0)
+                if delta > 0.01 and mid > 0:
+                    move = mid / delta
+                    pct  = (move / spot) * 100 if spot else 0
+                    targets.append(round(pct, 2))
+            stats["sample_target_pcts"] = targets
+            stats["contracts_with_target_lt_15pct"] = sum(1 for t in targets if t < 15)
+        
+        return stats
+    except Exception as e:
+        import traceback
+        return {"error": str(e), "traceback": traceback.format_exc()}
+
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# GEX summary helper (used by scan endpoints)
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+def _build_gex_summary(chain: dict, spot: float) -> dict:
+    """Build a minimal GEX summary dict from a raw Schwab chain."""
+    import math as _math
+    call_map = {}; put_map = {}
+
+    def _parse(exp_map, is_call):
+        for exp_key, options in exp_map.items():
+            if not isinstance(options, dict): continue
+            for strike_str, clist in options.items():
+                contracts = clist if isinstance(clist, list) else [clist]
+                for c in contracts:
+                    if not isinstance(c, dict): continue
+                    strike = c.get("strikePrice", 0)
+                    gamma  = abs(c.get("gamma", 0) or 0)
+                    oi     = c.get("totalVolume") or c.get("openInterest") or 0
+                    gex    = gamma * oi * 100 * (spot ** 2) / 1e9
+                    m = call_map if is_call else put_map
+                    m[strike] = m.get(strike, 0) + (gex if is_call else -gex)
+
+    _parse(chain.get("callExpDateMap", {}), True)
+    _parse(chain.get("putExpDateMap",  {}), False)
+
+    all_strikes = sorted(set(list(call_map.keys()) + list(put_map.keys())))
+    if not all_strikes:
+        return None
+
+    rows = []
+    net_total = 0; pin_strike = None; pin_val = 0
+    call_wall = None; call_wall_val = 0
+    put_wall  = None; put_wall_val  = 0
+
+    for strike in all_strikes:
+        total = round((call_map.get(strike, 0) + put_map.get(strike, 0)), 2)
+        rows.append({"strike": strike, "total": total})
+        net_total += total
+        if abs(total) > abs(pin_val):
+            pin_val = total; pin_strike = strike
+        if total > call_wall_val and strike > spot:
+            call_wall_val = total; call_wall = strike
+        if total < put_wall_val and strike < spot:
+            put_wall_val = total; put_wall = strike
+
+    return {
+        "spot": spot, "rows": rows, "net_gex": round(net_total, 1),
+        "pin_strike": pin_strike, "call_wall": call_wall, "put_wall": put_wall,
+    }
+
+
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Play History API Routes
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+@app.get("/history")
+def get_play_history():
+    return brain_state()
+
+
 if __name__ == "__main__":
     import uvicorn
     print("\n" + "="*60)
-    print("  OptionsEdge AI v2.0 — Backend")
-    print(f"  Mode:     {'🔴 LIVE (Schwab)' if USE_LIVE_DATA else '🟡 MOCK (no key needed)'}")
-    print(f"  Features: Scanner · Probability · Technicals · Watchlists")
+    print("  OptionsEdge AI v2.0 â€” Backend")
+    print(f"  Mode:     {'ðŸ”´ LIVE (Schwab)' if USE_LIVE_DATA else 'ðŸŸ¡ MOCK (no key needed)'}")
+    print(f"  Features: Scanner Â· Probability Â· Technicals Â· Watchlists")
     print(f"  Docs:     http://localhost:{PORT}/docs")
     print(f"  Scan:     http://localhost:{PORT}/scan")
     print(f"  Tech:     http://localhost:{PORT}/technicals/NVDA")
@@ -451,70 +750,62 @@ if __name__ == "__main__":
 # AI Learning endpoints
 # ----------------------------------------------------------------
 
-from core.ai_learning import (
-    log_play as _log_play,
-    close_play as _close_play,
-    get_state as _get_learning_state,
-    get_open_plays as _get_open_plays,
-    reset_weights as _reset_weights,
-)
+# ================================================================
+# AI Brain endpoints
+# ================================================================
 
-@app.get("/learning")
-def get_learning():
-    """Full AI learning state — weights, stats, insights."""
-    return _get_learning_state()
+@app.get("/brain")
+def get_brain():
+    return brain_state()
 
-@app.get("/learning/plays")
-def get_open_plays():
-    """All open (not yet closed) logged plays."""
-    return {"plays": _get_open_plays()}
-
-class LogPlayRequest(BaseModel):
-    ticker: str
-    option_type: str
-    strike: float
-    expiry: str
-    premium: float
-    score: int
-    rr: float
-    likelihood_pct: float
-    tech_bias: float
-    iv_rank: int
-    delta: float
-    target_pct: float
-    dte: int
-    tech_signals: List[str] = []
-    notes: str = ""
-
-@app.post("/learning/plays")
-def log_play_endpoint(req: LogPlayRequest):
-    """Log a new play when you enter a trade."""
-    result = _log_play(**req.dict())
+@app.post("/brain/track/{play_id}")
+def brain_track_endpoint(play_id: str, entry_premium: float = 0.0, notes: str = ""):
+    result = brain_track(play_id, entry_premium=entry_premium or None, notes=notes)
     if not result["success"]:
-        raise HTTPException(status_code=400, detail=result.get("error"))
+        raise HTTPException(status_code=404, detail=result.get("error"))
     return result
 
-class ClosePlayRequest(BaseModel):
+class BrainCloseRequest(BaseModel):
     exit_premium: float
-    result: str   # WIN, LOSS, PARTIAL, EXPIRED
+    result: str
     notes: str = ""
 
-@app.post("/learning/plays/{play_id}/close")
-def close_play_endpoint(play_id: str, req: ClosePlayRequest):
-    """Close a play with outcome — triggers AI weight adjustment."""
-    result = _close_play(play_id, req.exit_premium, req.result, req.notes)
-    if not result["success"]:
-        raise HTTPException(status_code=400, detail=result.get("error"))
-    return result
+@app.post("/brain/close/{play_id}")
+def brain_close_endpoint(play_id: str, req: BrainCloseRequest):
+    if req.result not in ("WIN","PARTIAL","LOSS","EXPIRED"):
+        raise HTTPException(status_code=400, detail="result must be WIN/PARTIAL/LOSS/EXPIRED")
+    r = brain_close(play_id, req.exit_premium, req.result, req.notes)
+    if not r["success"]:
+        raise HTTPException(status_code=404, detail=r.get("error"))
+    return r
+
+class BrainUpdateRequest(BaseModel):
+    entry_premium: float = None
+    notes: str = None
+
+@app.patch("/brain/plays/{play_id}")
+def brain_update_endpoint(play_id: str, req: BrainUpdateRequest):
+    r = brain_update_entry(play_id, req.entry_premium, req.notes)
+    if not r["success"]:
+        raise HTTPException(status_code=404, detail=r.get("error"))
+    return r
+
+@app.post("/brain/reset")
+def brain_reset_endpoint():
+    return brain_reset()
+
+# backwards compat
+@app.get("/learning")
+def get_learning_compat():
+    return brain_state()
 
 @app.post("/learning/reset")
-def reset_learning():
-    """Reset AI weights back to defaults."""
-    return _reset_weights()
+def reset_learning_compat():
+    return brain_reset()
 
 
 # ----------------------------------------------------------------
-# 0DTE endpoints — real-time polling + WebSocket stream
+# 0DTE endpoints â€” real-time polling + WebSocket stream
 # ----------------------------------------------------------------
 
 import asyncio
@@ -531,7 +822,7 @@ from core.zero_dte import (
     WINDOWS,
 )
 
-# 0DTE watchlist — most liquid 0DTE underlyings
+# 0DTE watchlist â€” most liquid 0DTE underlyings
 ZERO_DTE_WATCHLIST = ["SPY", "QQQ", "AAPL", "NVDA", "TSLA", "META", "AMZN", "MSFT"]
 
 
@@ -548,7 +839,7 @@ async def run_0dte_scan_async(
     contract_type: str   = "ALL",
     symbols: list        = None,
 ) -> dict:
-    """Run a full 0DTE scan — called by both REST and WebSocket."""
+    """Run a full 0DTE scan â€” called by both REST and WebSocket."""
     tickers  = symbols or ZERO_DTE_WATCHLIST
     window   = get_session_window()
     mins     = minutes_until_close()
@@ -598,7 +889,7 @@ async def scan_zero_dte(
     contract_type:  str   = Query("ALL"),
     symbols: Optional[str] = Query(None, description="Comma-separated symbols"),
 ):
-    """Single 0DTE scan — returns current high-probability plays."""
+    """Single 0DTE scan â€” returns current high-probability plays."""
     sym_list = symbols.upper().split(",") if symbols else None
     return await run_0dte_scan_async(min_score, min_likelihood, contract_type, sym_list)
 
@@ -618,7 +909,7 @@ def get_session():
     }
 
 
-# ── WebSocket — pushes updated 0DTE plays every N seconds ────────
+# â”€â”€ WebSocket â€” pushes updated 0DTE plays every N seconds â”€â”€â”€â”€â”€â”€â”€â”€
 
 class ZeroDteConnectionManager:
     def __init__(self):
@@ -680,7 +971,7 @@ async def zero_dte_stream(
         ws_manager.disconnect(websocket)
 
 
-# ── SSE fallback (for browsers that prefer EventSource) ──────────
+# â”€â”€ SSE fallback (for browsers that prefer EventSource) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @app.get("/zero-dte/sse")
 async def zero_dte_sse(
@@ -689,7 +980,7 @@ async def zero_dte_sse(
     min_likelihood: float = Query(55.0),
 ):
     """
-    Server-Sent Events stream — alternative to WebSocket.
+    Server-Sent Events stream â€” alternative to WebSocket.
     Use EventSource in the browser: new EventSource('/zero-dte/sse')
     """
     async def event_generator():
@@ -708,8 +999,8 @@ async def zero_dte_sse(
     )
 
 
-# ── Serve the frontend HTML directly from the backend ────────────
-# This means your Railway URL IS your app — no separate hosting needed.
+# â”€â”€ Serve the frontend HTML directly from the backend â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# This means your Railway URL IS your app â€” no separate hosting needed.
 
 from fastapi.responses import HTMLResponse
 import pathlib
@@ -720,156 +1011,353 @@ def serve_frontend():
     """Serve juicyscanner.html from the same server."""
     html_path = pathlib.Path(__file__).parent / "juicyscanner.html"
     if html_path.exists():
-        content = html_path.read_text()
+        content = html_path.read_text(encoding='utf-8')
         # Auto-inject the correct API URL so the frontend always points to itself
         content = content.replace(
             "const API = 'http://localhost:8000'",
             "const API = ''"   # empty string = same origin, works on any domain
         )
         return HTMLResponse(content=content)
-    return HTMLResponse("<h1>juicyscanner.html not found — add it to the project folder</h1>", status_code=404)
+    return HTMLResponse("<h1>juicyscanner.html not found â€” add it to the project folder</h1>", status_code=404)
+
 
 
 # ----------------------------------------------------------------
-# GEX (Gamma Exposure) Heatmap endpoint
+# Market Sentiment / Fear-Greed endpoint
+# ----------------------------------------------------------------
+
+@app.get("/sentiment")
+def get_sentiment():
+    """
+    Returns VIX-based fear/greed score + SPY data.
+    Score 0 = extreme fear, 100 = extreme greed.
+    """
+    try:
+        # VIX â€” Schwab uses $VIX
+        vix_sym = "$VIX" if USE_LIVE_DATA else "VIX"
+        spy_sym = "SPY"
+        
+        vix_q = fetch_quote(vix_sym)
+        spy_q = fetch_quote(spy_sym)
+        
+        vix = (vix_q.get("lastPrice") or vix_q.get("mark") or 
+               vix_q.get("closePrice") or 18.0)
+        spy = (spy_q.get("lastPrice") or spy_q.get("mark") or 
+               spy_q.get("closePrice") or 590.0)
+        spy_chg = (spy_q.get("netPercentChangeInDouble") or 
+                   spy_q.get("regularMarketPercentChange") or 0.0)
+
+        # VIX â†’ score (inverted: high VIX = fear = low score)
+        if   vix < 12:  score = 95
+        elif vix < 15:  score = 80
+        elif vix < 18:  score = 65
+        elif vix < 22:  score = 50
+        elif vix < 26:  score = 35
+        elif vix < 30:  score = 20
+        elif vix < 40:  score = 10
+        else:           score = 3
+
+        # SPY momentum nudge Â±10
+        if   spy_chg >  1.5: score = min(100, score + 10)
+        elif spy_chg >  0.5: score = min(100, score + 5)
+        elif spy_chg < -1.5: score = max(0,   score - 10)
+        elif spy_chg < -0.5: score = max(0,   score - 5)
+
+        if   score >= 75: mood = "EXTREME GREED"
+        elif score >= 55: mood = "GREED"
+        elif score >= 45: mood = "NEUTRAL"
+        elif score >= 25: mood = "FEAR"
+        else:             mood = "EXTREME FEAR"
+
+        return {
+            "score":   score,
+            "mood":    mood,
+            "vix":     round(float(vix), 2),
+            "spy":     round(float(spy), 2),
+            "spy_chg": round(float(spy_chg), 2),
+            "mode":    "LIVE" if USE_LIVE_DATA else "MOCK",
+        }
+    except Exception as e:
+        # Fallback neutral reading
+        return {"score": 50, "mood": "NEUTRAL", "vix": None, "spy": None, "spy_chg": 0, "error": str(e)}
+
+# ----------------------------------------------------------------
+# GEX (Gamma Exposure) â€” superior node-detection engine
+# Ported from spx_nodes.py: sign-correct GEX, flip zone, regime labels
 # ----------------------------------------------------------------
 
 import math as _math
 
-@app.get("/gex/{symbol}")
-def get_gex(
-    symbol:    str,
-    days:      int   = Query(5,  description="Number of expiry dates to include"),
-    strike_range: int = Query(30, description="Number of strikes above/below ATM"),
-):
+# â”€â”€ GEX helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+def _compute_gex_map(chain: dict, spot: float) -> dict:
     """
-    Returns GEX (Gamma Exposure) data by strike and expiry date.
-    GEX = gamma × open_interest × 100 × spot²  (per contract, per $1 move)
-    Positive GEX = dealers long gamma (market stabilizing)
-    Negative GEX = dealers short gamma (market amplifying / volatile)
+    GEX = sign Ã— |gamma| Ã— OI Ã— 100 Ã— spot
+    sign = +1 for calls, -1 for puts
+    Returns { strike: { exp_date: gex_value } }
+
+    For index options (SPX/SPXW), Schwab returns openInterest=0 on chain endpoint.
+    Fallback order: openInterest â†’ totalVolume â†’ skip.
+    Contracts with gamma=0 are skipped (Greeks not populated).
     """
-    if USE_LIVE_DATA:
-        chain = get_schwab_client().get_options_chain(symbol, days_to_exp=days*5, contract_type="ALL")
-        spot  = chain.get("underlyingPrice", 100)
-    else:
-        from core.zero_dte import generate_mock_0dte_chain
-        from data.mock_data import generate_mock_chain
-        # Use full chain mock for multi-expiry GEX
-        chain = _generate_mock_gex_chain(symbol, days, strike_range)
-        spot  = chain["underlyingPrice"]
+    gex = {}
+    total_contracts = 0
+    skipped_no_oi   = 0
+    skipped_no_gamma = 0
 
-    spot = chain.get("underlyingPrice", 100)
-
-    # Collect all expiry dates
-    all_expiries = set()
-    call_map = {}  # {expiry: {strike: gex}}
-    put_map  = {}
-
-    def _parse_contracts(exp_map, is_call):
+    for side, exp_map in [("CALL", chain.get("callExpDateMap", {})),
+                           ("PUT",  chain.get("putExpDateMap",  {}))]:
         for exp_key, options in exp_map.items():
-            expiry = exp_key.split(":")[0] if ":" in exp_key else exp_key
-            if expiry not in (call_map if is_call else put_map):
-                (call_map if is_call else put_map)[expiry] = {}
-            all_expiries.add(expiry)
-            # Handle both Schwab live {strike: [contract]} and mock [contract] formats
+            exp_date = exp_key.split(":")[0] if ":" in exp_key else exp_key
+            # Schwab live: {strike_str: [contract, ...]}  |  mock: [contract, ...]
             if isinstance(options, dict):
                 items = []
-                for strike_str, clist in options.items():
+                for sk, clist in options.items():
                     if isinstance(clist, list): items += clist
                     elif isinstance(clist, dict): items.append(clist)
             else:
                 items = options if isinstance(options, list) else []
+
             for c in items:
                 if not isinstance(c, dict): continue
-                strike = c.get("strikePrice", 0)
-                gamma  = abs(c.get("gamma", 0))
-                oi     = c.get("openInterest", 0)
-                gex = gamma * oi * 100 * (spot ** 2) / 1e9
-                gex = round(gex, 1)
-                if is_call:
-                    call_map[expiry][strike] = gex
-                else:
-                    put_map[expiry][strike]  = -gex
+                total_contracts += 1
+                strike = round(float(c.get("strikePrice", 0)), 2)
+                gamma  = c.get("gamma", 0) or 0
+                if gamma == 0:
+                    skipped_no_gamma += 1
+                    continue
+                oi = c.get("openInterest", 0) or 0
+                if oi == 0:
+                    oi = c.get("totalVolume", 0) or 0
+                if oi == 0:
+                    skipped_no_oi += 1
+                    continue
+                sign = 1 if side == "CALL" else -1
+                val  = sign * abs(gamma) * oi * 100 * spot
+                gex.setdefault(strike, {})
+                gex[strike][exp_date] = gex[strike].get(exp_date, 0) + val
 
-    _parse_contracts(chain.get("callExpDateMap", {}), True)
-    _parse_contracts(chain.get("putExpDateMap",  {}), False)
+    # Log diagnostics (visible in Railway logs)
+    print(f"[GEX] contracts={total_contracts} skipped_no_gamma={skipped_no_gamma} skipped_no_oi={skipped_no_oi} strikes_with_data={len(gex)}")
+    return gex
 
-    # Sort expiries, take first `days`
-    sorted_expiries = sorted(all_expiries)[:days]
 
-    # Build strike range around ATM
-    all_strikes = set()
-    for d in [call_map, put_map]:
-        for exp, strikes in d.items():
-            all_strikes.update(strikes.keys())
+def _find_flip_zone(net: dict, strikes: list, spot: float) -> float:
+    """Strike where net GEX crosses zero â€” closest to spot."""
+    asc = sorted(strikes)
+    crossings = []
+    for i in range(len(asc) - 1):
+        s1, s2 = asc[i], asc[i + 1]
+        g1, g2 = net.get(s1, 0), net.get(s2, 0)
+        if (g1 > 0 and g2 <= 0) or (g1 <= 0 and g2 > 0):
+            if abs(g1 - g2) > 0.001:
+                crossings.append(round(s1 + (s2 - s1) * (g1 / (g1 - g2)), 2))
+            else:
+                crossings.append(round((s1 + s2) / 2, 2))
+    return min(crossings, key=lambda x: abs(x - spot)) if crossings else round(spot, 2)
 
-    if not all_strikes:
-        raise HTTPException(status_code=400, detail="No options data found")
 
-    atm_strike = min(all_strikes, key=lambda s: abs(s - spot))
-    sorted_all = sorted(all_strikes)
-    atm_idx    = sorted_all.index(atm_strike)
-    lo = max(0, atm_idx - strike_range)
-    hi = min(len(sorted_all), atm_idx + strike_range + 1)
-    strikes_to_show = sorted_all[lo:hi]
+def _detect_nodes(net: dict, strikes: list, spot: float):
+    """
+    Regime-aware GEX node labeler.
+    POS Î³ regime: WALL (call wall above), FLOOR (put wall below),
+                  GATE (neg node above), TRAP (neg node below)
+    NEG Î³ regime: GATE (neg above), ACCEL (neg below), MGNT (pos magnets)
+    Special:      RUG + BREACH (compressed walls with no buffer)
+    """
+    total_net = sum(net.values())
+    mx        = max((abs(v) for v in net.values()), default=1) or 1
+    is_neg    = total_net < 0
 
-    # Build heatmap rows
-    rows = []
-    net_gex_total = 0
-    call_wall_strike, call_wall_val = 0, 0
-    put_wall_strike,  put_wall_val  = 0, 0
+    above = [s for s in strikes if s > spot]
+    below = [s for s in strikes if s < spot]
 
-    for strike in reversed(strikes_to_show):
-        row = {"strike": strike, "is_atm": abs(strike - spot) < (strikes_to_show[1] - strikes_to_show[0]) * 0.6 if len(strikes_to_show) > 1 else False, "cells": {}}
-        row_total = 0
-        for exp in sorted_expiries:
-            call_gex = call_map.get(exp, {}).get(strike, 0)
-            put_gex  = put_map.get(exp,  {}).get(strike, 0)
-            net      = round(call_gex + put_gex, 1)
-            row["cells"][exp] = net
-            row_total += net
+    def sp(zone): return next(iter(sorted([s for s in zone if net.get(s,0) > 0], key=lambda s: -net[s])), None)
+    def sn(zone): return next(iter(sorted([s for s in zone if net.get(s,0) < 0], key=lambda s:  net[s])), None)
 
-        row["total"] = round(row_total, 1)
-        net_gex_total += row_total
+    spa = sp(above); spb = sp(below)
+    sna = sn(above); snb = sn(below)
+    sig = lambda s: s is not None and abs(net.get(s, 0)) / mx > 0.20
 
-        # Track walls
-        if row_total > call_wall_val and strike > spot:
-            call_wall_val = row_total; call_wall_strike = strike
-        if row_total < put_wall_val and strike < spot:
-            put_wall_val = row_total; put_wall_strike = strike
+    nodes = {}
+    if is_neg:
+        if sig(sna): nodes[sna] = "GATE"
+        if sig(snb): nodes[snb] = "ACCEL"
+        if sig(spa): nodes[spa] = "MGNT"
+        if sig(spb): nodes[spb] = "MGNT"
+    else:
+        if sig(spa): nodes[spa] = "WALL"
+        if sig(spb): nodes[spb] = "FLOOR"
+        if sig(sna): nodes[sna] = "GATE"
+        if sig(snb): nodes[snb] = "TRAP"
 
-        rows.append(row)
+    # RUG PULL: strong positive directly above strong negative with no buffer
+    if spa and snb and net.get(spa,0)/mx > 0.45 and abs(net.get(snb,0))/mx > 0.35:
+        buffer = [s for s in strikes if snb < s < spa and net.get(s,0) > mx*0.15]
+        if not buffer:
+            nodes[spa] = "RUG"
+            nodes[snb] = "BREACH"
 
-    # Pin strike = highest absolute GEX
-    pin_row = max(rows, key=lambda r: abs(r["total"]), default=None)
+    return nodes, total_net
 
-    # Scale for color intensity
-    all_vals = [c for r in rows for c in r["cells"].values() if c != 0]
-    max_abs  = max((abs(v) for v in all_vals), default=1)
 
-    return {
-        "symbol":       symbol.upper(),
-        "spot":         spot,
-        "expiries":     sorted_expiries,
-        "strikes":      [r["strike"] for r in rows],
-        "rows":         rows,
-        "max_abs":      round(max_abs, 1),
-        "net_gex":      round(net_gex_total, 1),
-        "pin_strike":   pin_row["strike"] if pin_row else None,
-        "call_wall":    call_wall_strike,
-        "put_wall":     put_wall_strike,
-        "atm_strike":   atm_strike,
-    }
+NODE_COLORS = {
+    "WALL":   "#f59e0b",   # amber
+    "FLOOR":  "#22c55e",   # green
+    "GATE":   "#ef4444",   # red
+    "TRAP":   "#f97316",   # orange
+    "ACCEL":  "#dc2626",   # dark red
+    "MGNT":   "#a855f7",   # purple
+    "RUG":    "#ec4899",   # pink
+    "BREACH": "#be185d",   # deep pink
+}
+
+@app.get("/gex/{symbol}")
+def get_gex(
+    symbol:       str,
+    days:         int = Query(5,  description="Number of expiry dates to include"),
+    strike_range: int = Query(60, description="Number of strikes above/below ATM"),
+):
+    """
+    GEX heatmap â€” sign-correct formula: GEX = sign x |gamma| x OI x 100 x spot
+    Includes flip zone, regime detection, and labeled nodes.
+    """
+    sym = symbol.upper()
+    # Schwab requires $SPX / $SPXW for index options
+    api_sym = sym
+    if sym in ("SPXW", "SPX"):
+        api_sym = "$" + sym
+    try:
+        if USE_LIVE_DATA:
+            client = get_schwab_client()
+            chain  = client.get_options_chain(api_sym, days_to_exp=days * 10, contract_type="ALL")
+            spot   = chain.get("underlyingPrice") or 0
+            if spot <= 0:
+                try:
+                    q    = client.get_quote(sym)
+                    spot = q.get("lastPrice") or q.get("mark") or q.get("closePrice") or 0
+                except Exception:
+                    spot = 0
+            if spot <= 0:
+                try:
+                    first_exp    = next(iter(chain.get("callExpDateMap", {}).values()))
+                    first_strike = float(next(iter(first_exp.keys())))
+                    spot = first_strike
+                except Exception:
+                    spot = 100
+        else:
+            chain = _generate_mock_gex_chain(symbol, days, strike_range)
+            spot  = chain["underlyingPrice"]
+
+        # Compute GEX map
+        gex_map = _compute_gex_map(chain, spot)
+        if not gex_map:
+            raise HTTPException(status_code=400, detail="No options data found â€” gamma may be zero for all contracts")
+
+        # Build strike list within 6% of spot
+        all_strikes_raw = sorted(gex_map.keys())
+        strikes = [s for s in all_strikes_raw if abs(s - spot) <= spot * 0.06]
+        if not strikes:
+            strikes = all_strikes_raw
+
+        # Use up to `days` nearest expirations
+        all_exps = sorted(set(e for sd in gex_map.values() for e in sd.keys()))
+        exps     = all_exps[:days]
+
+        # Net GEX per strike across selected expiries
+        net = {}
+        for s in strikes:
+            net[s] = sum(gex_map.get(s, {}).get(e, 0) for e in exps)
+
+        # Flip zone
+        flip = _find_flip_zone(net, strikes, spot)
+
+        # Node detection
+        nodes, total_net = _detect_nodes(net, strikes, spot)
+        regime     = "NEG_GAMMA" if total_net < 0 else "POS_GAMMA"
+        regime_lbl = "NEG gamma â€” moves AMPLIFY" if total_net < 0 else "POS gamma â€” moves DAMPEN"
+
+        # Build heatmap rows
+        atm_strike = min(strikes, key=lambda s: abs(s - spot))
+        mx         = max((abs(v) for v in net.values()), default=1) or 1
+
+        rows = []
+        for strike in sorted(strikes, reverse=True):
+            cells = {}
+            for exp in exps:
+                raw = gex_map.get(strike, {}).get(exp, 0)
+                cells[exp] = round(raw / 1e6, 3)   # $M for display
+            rows.append({
+                "strike":     strike,
+                "is_atm":     strike == atm_strike,
+                "cells":      cells,
+                "total":      round(net[strike] / 1e6, 3),
+                "intensity":  round(net[strike] / mx, 3),
+                "node":       nodes.get(strike),
+                "node_color": NODE_COLORS.get(nodes.get(strike), ""),
+            })
+
+        # Walls + pin
+        call_wall  = next((s for s, l in nodes.items() if l in ("WALL", "RUG")    and s > spot), None)
+        put_wall   = next((s for s, l in nodes.items() if l in ("FLOOR", "BREACH") and s < spot), None)
+        pin_strike = max(strikes, key=lambda s: abs(net[s]), default=None)
+
+        node_list = sorted(
+            [{"strike": s, "label": l, "gex_M": round(net[s] / 1e6, 2),
+              "color": NODE_COLORS.get(l, ""), "above_spot": s > spot}
+             for s, l in nodes.items()],
+            key=lambda x: x["strike"], reverse=True,
+        )
+
+        return {
+            "symbol":       sym,
+            "spot":         spot,
+            "expiries":     exps,
+            "strikes":      [r["strike"] for r in rows],
+            "rows":         rows,
+            "max_abs":      round(mx / 1e6, 2),
+            "net_gex":      round(total_net / 1e6, 2),
+            "net_gex_M":    round(total_net / 1e6, 2),
+            "regime":       regime,
+            "regime_label": regime_lbl,
+            "flip_zone":    flip,
+            "flip_above":   flip > spot,
+            "pin_strike":   pin_strike,
+            "call_wall":    call_wall,
+            "put_wall":     put_wall,
+            "atm_strike":   atm_strike,
+            "nodes":        node_list,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        print(f"[GEX ERROR] {sym}: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"GEX failed for {sym}: {str(e)}")
+
 
 
 def _generate_mock_gex_chain(symbol: str, days: int, strike_range: int) -> dict:
-    """Multi-expiry mock chain for GEX heatmap."""
+    """
+    Multi-expiry mock chain for GEX heatmap.
+    Generates realistic gamma + OI profiles so the node detector works in mock mode.
+    Deliberately places strong nodes at round-number strikes to mimic real SPX structure.
+    """
     import random, datetime
-    prices = {"SPY":590,"QQQ":505,"SPX":5900,"NVDA":138,"AAPL":221,"TSLA":295,"META":632,"MSFT":415,"AMZN":227}
-    spot   = prices.get(symbol.upper(), 100) * random.uniform(0.997, 1.003)
-    step   = round(spot * 0.002, 0) or 1  # ~0.2% steps
+    prices = {
+        "SPY":590,"QQQ":505,"SPX":5900,"SPXW":5900,
+        "NVDA":138,"AAPL":221,"TSLA":295,"META":632,"MSFT":415,"AMZN":227,
+        "AMD":112,"COIN":255,"GLD":231,"GOOGL":192,"NFLX":1015,
+    }
+    spot   = prices.get(symbol.upper(), 200) * random.uniform(0.997, 1.003)
+    # SPX-style: $5 steps; equity: ~0.5% steps
+    step   = 5 if spot > 1000 else round(spot * 0.005, 0) or 1
 
-    # Generate business day expiries
+    # Round spot to nearest step
+    spot = round(round(spot / step) * step, 2)
+
+    # Business day expiries
     expiries = []
     d = datetime.date.today()
     while len(expiries) < days:
@@ -877,31 +1365,50 @@ def _generate_mock_gex_chain(symbol: str, days: int, strike_range: int) -> dict:
             expiries.append(str(d))
         d += datetime.timedelta(days=1)
 
+    # Choose random "wall" strikes for realism
+    wall_above = round(spot + step * random.randint(4, 10), 0)
+    wall_below = round(spot - step * random.randint(4, 10), 0)
+
     call_map, put_map = {}, {}
     for exp in expiries:
-        call_map[exp] = []
-        put_map[exp]  = []
+        call_contracts = []
+        put_contracts  = []
         for i in range(-strike_range, strike_range + 1):
             strike = round(spot + i * step, 1)
-            dist   = abs(i) / strike_range
-            # OI peaks near ATM, drops off with distance
-            base_oi = int(random.uniform(500, 3000) * (1 - dist * 0.7))
-            # Gamma peaks near ATM
-            gamma   = max(0.001, 0.08 * (1 - dist * 0.85) * random.uniform(0.7, 1.3))
+            dist   = abs(i) / max(strike_range, 1)
 
-            call_map[exp].append({"strikePrice": strike, "gamma": gamma,
-                "openInterest": base_oi + random.randint(0, 2000),
-                "putCall": "CALL", "daysToExpiration": 1})
-            put_map[exp].append({"strikePrice": strike, "gamma": gamma,
-                "openInterest": base_oi + random.randint(0, 2000),
-                "putCall": "PUT",  "daysToExpiration": 1})
+            # Base gamma: bell curve around ATM
+            base_gamma = max(0.0001, 0.06 * (1 - dist * 0.9) * random.uniform(0.8, 1.2))
+
+            # Base OI: higher near ATM, spikes at walls
+            base_oi = int(random.uniform(200, 2000) * (1 - dist * 0.65))
+            if abs(strike - wall_above) < step * 1.5:
+                base_oi = int(base_oi * random.uniform(3.0, 6.0))  # call wall spike
+            if abs(strike - wall_below) < step * 1.5:
+                base_oi = int(base_oi * random.uniform(2.5, 5.0))  # put wall spike
+
+            call_contracts.append({
+                "strikePrice": strike, "gamma": base_gamma,
+                "openInterest": base_oi + random.randint(0, 500),
+                "totalVolume":  random.randint(10, 300),
+                "putCall": "CALL", "daysToExpiration": (expiries.index(exp)+1),
+            })
+            put_contracts.append({
+                "strikePrice": strike, "gamma": base_gamma,
+                "openInterest": int(base_oi * random.uniform(0.8, 1.4)) + random.randint(0, 300),
+                "totalVolume":  random.randint(10, 300),
+                "putCall": "PUT",  "daysToExpiration": (expiries.index(exp)+1),
+            })
+
+        call_map[exp] = call_contracts
+        put_map[exp]  = put_contracts
 
     return {
-        "symbol": symbol.upper(),
-        "underlyingPrice": round(spot, 2),
-        "callExpDateMap": call_map,
-        "putExpDateMap":  put_map,
-        "status": "SUCCESS",
+        "symbol":           symbol.upper(),
+        "underlyingPrice":  round(spot, 2),
+        "callExpDateMap":   call_map,
+        "putExpDateMap":    put_map,
+        "status":           "SUCCESS",
     }
 
 
@@ -925,6 +1432,7 @@ async def get_flow(
     min_vol_oi:   float = Query(0.3,   description="Min vol/OI ratio"),
     contract_type:str   = Query("ALL", description="CALL / PUT / ALL"),
     filter_hedges:bool  = Query(True,  description="Filter out hedging prints"),
+    exclude:      str   = Query(None,  description="Comma-separated symbols to exclude"),
     symbols:      str   = Query(None,  description="Comma-separated symbols"),
 ):
     """Scan for unusual options flow across watchlist."""
@@ -953,6 +1461,11 @@ async def get_flow(
             prints = [p for p in prints if p["type"] == contract_type]
         prints = [p for p in prints if p["score"] >= min_score and p["notional"] >= min_notional]
 
+    # Apply exclude filter
+    if exclude:
+        excl_set = {s.strip().upper() for s in exclude.split(",")}
+        prints = [p for p in prints if p.get("symbol", "").upper() not in excl_set]
+
     summary = summarize_flow(prints)
 
     total_bull = sum(p["notional"] for p in prints if p["direction"] == "BULLISH")
@@ -978,3 +1491,4 @@ async def get_flow(
             "filter_hedges":filter_hedges,
         }
     }
+

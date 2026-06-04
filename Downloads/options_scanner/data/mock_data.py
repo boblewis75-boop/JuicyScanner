@@ -112,16 +112,27 @@ def get_mock_quote(symbol: str) -> dict:
         "GOOGL": 192.00, "AMZN": 227.00, "TSLA": 295.00, "SPY": 590.00,
         "QQQ": 505.00, "GLD": 231.00, "AMD": 112.00, "CRM": 325.00,
         "NFLX": 1015.00, "UBER": 82.00, "COIN": 255.00,
+        # Indexes & volatility
+        "VIX": 18.50, "$VIX": 18.50, "IWM": 198.00, "DIA": 430.00,
+        "SPX": 5900.00, "$SPX": 5900.00, "SPXW": 5900.00,
     }
-    price = prices.get(symbol, 100.00) * random.uniform(0.97, 1.03)
+    price = prices.get(symbol, 50.00) * random.uniform(0.97, 1.03)
+    open_price = price * random.uniform(0.98, 1.02)
+    chg = price - open_price
+    chg_pct = (chg / open_price) * 100
     return {
-        "symbol": symbol,
+        "symbol":  symbol,
         "lastPrice": round(price, 2),
+        "mark":      round(price, 2),
         "bidPrice":  round(price * 0.999, 2),
         "askPrice":  round(price * 1.001, 2),
-        "openPrice": round(price * random.uniform(0.98, 1.02), 2),
+        "openPrice": round(open_price, 2),
         "highPrice": round(price * random.uniform(1.00, 1.03), 2),
         "lowPrice":  round(price * random.uniform(0.97, 1.00), 2),
+        "closePrice": round(open_price, 2),
+        "netChange": round(chg, 2),
+        "netPercentChangeInDouble": round(chg_pct, 4),
+        "regularMarketPercentChange": round(chg_pct, 4),
         "totalVolume": random.randint(5_000_000, 80_000_000),
         "52WkHigh": round(price * random.uniform(1.05, 1.40), 2),
         "52WkLow":  round(price * random.uniform(0.60, 0.95), 2),

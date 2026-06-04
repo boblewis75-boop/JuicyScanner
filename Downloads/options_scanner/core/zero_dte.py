@@ -21,6 +21,7 @@ Scoring model is purpose-built for 0DTE:
 
 import math
 from typing import List, Dict, Any, Optional
+import pytz
 from datetime import datetime, time as dt_time
 
 
@@ -39,10 +40,23 @@ WINDOWS = [
 ]
 
 
+def get_eastern_time() -> dt_time:
+    """Get current time in US Eastern (ET) — handles EST/EDT automatically."""
+    try:
+        et = pytz.timezone("America/New_York")
+        return datetime.now(et).time()
+    except Exception:
+        # Fallback: UTC - 5 (rough EST)
+        from datetime import timezone, timedelta
+        utc = datetime.now(timezone.utc)
+        et = utc - timedelta(hours=5)
+        return et.time()
+
+
 def get_session_window(now: Optional[dt_time] = None) -> Dict:
     """Return current market window and quality rating."""
     if now is None:
-        now = datetime.now().time()
+        now = get_eastern_time()
     for w in WINDOWS:
         if w["start"] <= now < w["end"]:
             return w
@@ -54,7 +68,7 @@ def get_session_window(now: Optional[dt_time] = None) -> Dict:
 def minutes_until_close(now: Optional[dt_time] = None) -> int:
     """Minutes remaining in the trading day."""
     if now is None:
-        now = datetime.now().time()
+        now = get_eastern_time()
     close = dt_time(16, 0)
     if now >= close:
         return 0
@@ -472,7 +486,7 @@ def generate_mock_0dte_chain(symbol: str) -> Dict:
         "AMZN": 227.0, "META": 632.0, "MSFT": 415.0,
     }
     price = prices.get(symbol, 100.0) * random.uniform(0.995, 1.005)
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(pytz.timezone("America/New_York")).strftime("%Y-%m-%d")
 
     calls, puts = [], []
     for offset in [-0.025, -0.015, -0.005, 0, 0.005, 0.015, 0.025]:

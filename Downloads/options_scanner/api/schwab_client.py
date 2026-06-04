@@ -29,10 +29,27 @@ class SchwabClient:
     Handles token refresh automatically.
     """
 
+    TOKEN_FILE = "/app/schwab_tokens.json"  # persists across requests
+
     def __init__(self):
         self.access_token: Optional[str] = None
         self.refresh_token: Optional[str] = None
         self.token_expires_at: float = 0
+        self._load_tokens()  # load from disk on startup
+
+    def _load_tokens(self):
+        """Load tokens from disk if they exist."""
+        import json, os
+        try:
+            if os.path.exists(self.TOKEN_FILE):
+                with open(self.TOKEN_FILE, 'r') as f:
+                    data = json.load(f)
+                self.access_token     = data.get("access_token")
+                self.refresh_token    = data.get("refresh_token")
+                self.token_expires_at = data.get("token_expires_at", 0)
+                print(f"✅ Tokens loaded from {self.TOKEN_FILE}")
+        except Exception as e:
+            print(f"⚠️  Could not load tokens: {e}")
 
     # ------------------------------------------------------------------
     # STEP 1: Get the authorization URL — open this in your browser once
@@ -105,10 +122,21 @@ class SchwabClient:
         self._save_tokens(response.json())
 
     def _save_tokens(self, tokens: dict):
+        import json
         self.access_token    = tokens["access_token"]
         self.refresh_token   = tokens.get("refresh_token", self.refresh_token)
         expires_in           = tokens.get("expires_in", 1800)
-        self.token_expires_at = time.time() + expires_in - 60  # 60s buffer
+        self.token_expires_at = time.time() + expires_in - 60
+        # Persist to disk so tokens survive restarts
+        try:
+            with open(self.TOKEN_FILE, 'w') as f:
+                json.dump({
+                    "access_token":     self.access_token,
+                    "refresh_token":    self.refresh_token,
+                    "token_expires_at": self.token_expires_at,
+                }, f)
+        except Exception as e:
+            print(f"⚠️  Could not save tokens: {e}")
 
     def _get_headers(self) -> dict:
         if time.time() >= self.token_expires_at:
@@ -136,12 +164,12 @@ class SchwabClient:
             f"{MARKET_BASE}/chains",
             headers=self._get_headers(),
             params={
-                "symbol":       symbol,
-                "contractType": contract_type,
-                "strikeCount":  strike_count,
-                "fromDate":     from_date,
-                "toDate":       to_date,
-                "optionType":   "S",  # Standard options only (no weeklies filter here)
+                "symbol":        symbol,
+                "contractType":  contract_type,
+                "strikeCount":   120,       # more strikes for GEX heatmap
+                "fromDate":      from_date,
+                "toDate":        to_date,
+                "includeQuotes": "TRUE",    # ensures gamma/delta are populated
             },
         )
         resp.raise_for_status()
@@ -153,8 +181,51 @@ class SchwabClient:
     def get_quote(self, symbol: str) -> dict:
         """Returns current quote for a stock symbol."""
         resp = requests.get(
-            f"{MARKET_BASE}/quotes/{symbol}",
+            f"{MARKET_BASE}/quotes",
             headers=self._get_headers(),
+            params={"symbols": symbol, "fields": "quote"},
         )
         resp.raise_for_status()
-        return resp.json()
+        data = resp.json()
+        # Schwab returns {SYMBOL: {quote: {...}}} — flatten it
+        if symbol in data:
+            return data[symbol].get("quote", data[symbol])
+        return data
+    # ------------------------------------------------------------------
+    # Market Data: Price History (OHLCV bars)
+    # ------------------------------------------------------------------
+    def get_price_history(self, symbol: str, period_type: str = "month",
+                          period: int = 6, frequency_type: str = "daily",
+                          frequency: int = 1) -> list:
+        """
+        Fetch OHLCV daily bars for a symbol.
+        Returns list of {datetime, open, high, low, close, volume} dicts.
+        """
+        resp = requests.get(
+            f"{MARKET_BASE}/pricehistory",
+            headers=self._get_headers(),
+            params={
+                "symbol":        symbol,
+                "periodType":    period_type,
+                "period":        period,
+                "frequencyType": frequency_type,
+                "frequency":     frequency,
+                "needExtendedHoursData": False,
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        # Schwab returns {candles: [{open,high,low,close,volume,datetime}]}
+        candles = data.get("candles", [])
+        bars = []
+        for c in candles:
+            bars.append({
+                "datetime": c.get("datetime", 0),
+                "open":     c.get("open",   0),
+                "high":     c.get("high",   0),
+                "low":      c.get("low",    0),
+                "close":    c.get("close",  0),
+                "volume":   c.get("volume", 0),
+            })
+        return bars
+
