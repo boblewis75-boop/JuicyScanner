@@ -36,6 +36,11 @@ class SchwabClient:
         self.refresh_token: Optional[str] = None
         self.token_expires_at: float = 0
         self._load_tokens()  # load from disk on startup
+        # fallback: load refresh token from env var (for Railway)
+        if not self.refresh_token:
+            self.refresh_token = os.environ.get("SCHWAB_REFRESH_TOKEN")
+            if self.refresh_token:
+                print("✅ Refresh token loaded from environment variable")
 
     def _load_tokens(self):
         """Load tokens from disk if they exist."""
