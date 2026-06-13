@@ -96,6 +96,7 @@ class SchwabClient:
                 "redirect_uri": SCHWAB_CALLBACK_URL,
             },
         )
+print(f"Token exchange: {response.status_code} {response.text}")
         response.raise_for_status()
         tokens = response.json()
         self._save_tokens(tokens)
